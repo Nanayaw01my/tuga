@@ -828,7 +828,7 @@ window.addEventListener('offline', () => {
     showToast('You are offline. Check your connection.', 'error');
 });
 
-// ===== PAYSTACK & BUSINESS LOGIC =====
+// ===== PAYSTACK & BUSINESS LOGIC WITH EMAIL NOTIFICATIONS =====
 
 // MTN BUNDLES
 const bundles = [
@@ -848,11 +848,15 @@ const bundles = [
     { size: "100GB", price: 400.00, popular: false }
 ];
 
-// ===== IMPORTANT: USE YOUR LIVE PAYSTACK PUBLIC KEY =====
+// ===== IMPORTANT: REPLACE WITH YOUR LIVE PAYSTACK PUBLIC KEY =====
 const PAYSTACK_PUBLIC_KEY = 'pk_live_e1272333bf0cea881a01d82093937c5739731229'; // REPLACE WITH YOUR LIVE KEY
 
-// Your backend verification endpoint
+// ===== IMPORTANT: REPLACE WITH YOUR EMAIL FOR NOTIFICATIONS =====
+const MERCHANT_EMAIL = 'Nanayawgtbank@gmail.com'; // REPLACE WITH YOUR EMAIL
+
+// Your backend endpoints (replace with your actual domain)
 const API_ENDPOINT = 'https://yourdomain.com/verify-payment.php';
+const EMAIL_ENDPOINT = 'https://yourdomain.com/send-email-notification.php';
 
 let selectedBundle = null;
 
@@ -865,6 +869,9 @@ document.addEventListener('DOMContentLoaded', () => {
     
     // Add to history for back button handling
     history.pushState({ page: 'home' }, 'Home', window.location.href);
+    
+    // Retry failed emails every 5 minutes
+    setInterval(retryFailedEmails, 300000);
 });
 
 function renderBundles() {
@@ -993,7 +1000,12 @@ function initiatePaystackPayment(phone, paymentMethod) {
                     variable_name: "payment_method",
                     value: paymentMethod === 'momo' ? 'Mobile Money' : 'Card'
                 }
-            ]
+            ],
+            // Add merchant email for notification
+            merchant_email: MERCHANT_EMAIL,
+            customer_phone: phone,
+            bundle_size: selectedBundle.size,
+            bundle_price: selectedBundle.price
         },
         callback: function(response) {
             verifyPayment(response.reference, phone, selectedBundle);
@@ -1017,13 +1029,18 @@ function verifyPayment(reference, phone, bundle) {
             reference: reference,
             phone: phone,
             bundle: bundle.size,
-            amount: bundle.price
+            amount: bundle.price,
+            merchant_email: MERCHANT_EMAIL // Send merchant email for server-side notification
         })
     })
     .then(response => response.json())
     .then(data => {
         if (data.status === 'success') {
             showToast('Payment verified! Delivering data...', 'success');
+            
+            // Send email notification via server
+            sendEmailNotification(phone, bundle, reference);
+            
             processDataBundle(phone, bundle, reference);
         } else {
             showToast('Payment verification failed: ' + (data.message || 'Unknown error'), 'error');
@@ -1037,6 +1054,104 @@ function verifyPayment(reference, phone, bundle) {
     });
 }
 
+// Function to send email notification via server
+function sendEmailNotification(phone, bundle, reference) {
+    const paymentMethod = document.getElementById('paymentMethod').value;
+    
+    const emailData = {
+        to: MERCHANT_EMAIL,
+        subject: `New Data Bundle Purchase - ${bundle.size}`,
+        customer_phone: phone,
+        bundle_size: bundle.size,
+        amount: bundle.price,
+        reference: reference,
+        timestamp: new Date().toISOString(),
+        payment_method: paymentMethod === 'momo' ? 'Mobile Money' : 'Card'
+    };
+
+    // Send to your server endpoint that handles emails
+    fetch(EMAIL_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(emailData)
+    })
+    .then(response => response.json())
+    .then(data => {
+        console.log('Email notification sent:', data);
+        if (data.success) {
+            console.log('Email sent successfully');
+        } else {
+            console.error('Email sending failed:', data.message);
+            storeFailedEmail(emailData);
+        }
+    })
+    .catch(error => {
+        console.error('Failed to send email:', error);
+        // Fallback: Store in localStorage to retry later
+        storeFailedEmail(emailData);
+    });
+}
+
+// Store failed emails for retry
+function storeFailedEmail(emailData) {
+    let failedEmails = JSON.parse(localStorage.getItem('failed_emails') || '[]');
+    failedEmails.push({
+        ...emailData,
+        retry_count: 0,
+        last_attempt: new Date().toISOString()
+    });
+    localStorage.setItem('failed_emails', JSON.stringify(failedEmails));
+    console.log('Email stored for retry');
+}
+
+// Retry sending failed emails
+function retryFailedEmails() {
+    const failedEmails = JSON.parse(localStorage.getItem('failed_emails') || '[]');
+    if (failedEmails.length > 0) {
+        console.log(`Retrying ${failedEmails.length} failed emails...`);
+        
+        failedEmails.forEach((emailData, index) => {
+            // Only retry if less than 5 attempts and last attempt was more than 5 minutes ago
+            const lastAttempt = new Date(emailData.last_attempt || 0);
+            const now = new Date();
+            const minutesSinceLastAttempt = (now - lastAttempt) / (1000 * 60);
+            
+            if (emailData.retry_count < 5 && minutesSinceLastAttempt > 5) {
+                emailData.retry_count = (emailData.retry_count || 0) + 1;
+                emailData.last_attempt = now.toISOString();
+                
+                fetch(EMAIL_ENDPOINT, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(emailData)
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        // Remove from failed list
+                        failedEmails.splice(index, 1);
+                        localStorage.setItem('failed_emails', JSON.stringify(failedEmails));
+                        console.log('Failed email retry successful');
+                    } else {
+                        // Update with new attempt count
+                        localStorage.setItem('failed_emails', JSON.stringify(failedEmails));
+                    }
+                })
+                .catch(error => {
+                    console.error('Retry failed:', error);
+                    // Update last attempt
+                    localStorage.setItem('failed_emails', JSON.stringify(failedEmails));
+                });
+            } else if (emailData.retry_count >= 5) {
+                // Remove after 5 failed attempts
+                failedEmails.splice(index, 1);
+                localStorage.setItem('failed_emails', JSON.stringify(failedEmails));
+                console.log('Removed email after 5 failed attempts');
+            }
+        });
+    }
+}
+
 function disableSubmit(disabled) {
     const btn = document.querySelector('#paymentForm button[type="submit"]');
     btn.disabled = disabled;
@@ -1046,6 +1161,7 @@ function disableSubmit(disabled) {
 function processDataBundle(phone, bundle, ref) {
     showToast(`Sending ${bundle.size} to ${phone}...`, 'info');
 
+    // Simulate delivery (replace with actual API call)
     setTimeout(() => {
         logTransaction(phone, bundle, ref);
         showToast(`✅ ${bundle.size} delivered to ${phone}`, 'success');
@@ -1088,6 +1204,12 @@ function logTransaction(phone, bundle, ref) {
 function loadSavedTransactions() {
     const transactions = JSON.parse(localStorage.getItem('kk_transactions') || '[]');
     console.log('Previous transactions:', transactions.length);
+    
+    // Also load failed emails for retry
+    const failedEmails = JSON.parse(localStorage.getItem('failed_emails') || '[]');
+    if (failedEmails.length > 0) {
+        console.log('Pending emails to retry:', failedEmails.length);
+    }
 }
 
 function showToast(msg, type = 'info') {
@@ -1143,8 +1265,4 @@ if ('serviceWorker' in navigator) {
 }
 </script>
 </body>
-
 </html>
-
-
-
